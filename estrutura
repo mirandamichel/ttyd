@@ -1,0 +1,289 @@
+# Estrutura de diretórios:
+
+```
+├── Dockerfiles
+│   ├── apache
+│   │   └── Dockerfile
+│   ├── ttyd
+│       └── Dockerfile
+├── helm
+│   └── ttyd-apache-chart
+│       ├── charts
+│       ├── templates
+│       │   ├── deployment.yaml
+│       │   ├── service.yaml
+│       │   ├── ingress.yaml
+│       │   ├── configmap.yaml
+│       │   ├── secret.yaml
+│       │   ├── rbac.yaml
+│       │   └── _helpers.tpl
+│       ├── values.yaml
+│       └── Chart.yaml
+├── scripts
+│   ├── build.sh
+│   └── deploy.sh
+└── .github
+    └── workflows
+        └── ci-cd.yaml
+```
+
+# Dockerfile para Apache com LDAP (Dockerfiles/apache/Dockerfile):
+
+```dockerfile
+FROM ubuntu:20.04
+RUN apt-get update && apt-get install -y apache2 libapache2-mod-ldap-userdir
+RUN a2enmod ldap authnz_ldap
+COPY apache-config /etc/apache2/sites-available/000-default.conf
+ENTRYPOINT ["/usr/sbin/apache2ctl", "-D", "FOREGROUND"]
+```
+
+# Configuração do Apache com LDAP (apache-config):
+
+```apache
+<VirtualHost *:80>
+    ServerName ttyd-apache.local
+
+    <Location />
+        AuthType Basic
+        AuthName "Restricted Access"
+        AuthBasicProvider ldap
+        AuthLDAPURL ldap://ldap-server:389/ou=users,dc=example,dc=com?uid
+        Require valid-user
+    </Location>
+
+    ProxyPass / http://localhost:7681/
+    ProxyPassReverse / http://localhost:7681/
+</VirtualHost>
+```
+
+# Dockerfile para ttyd (Dockerfiles/ttyd/Dockerfile):
+
+```dockerfile
+FROM ubuntu:20.04
+RUN apt-get update && apt-get install -y ttyd awscli kubectl
+CMD ["ttyd", "bash"]
+```
+
+# Deployment Helm Chart (helm/ttyd-apache-chart/templates/deployment.yaml):
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ttyd-apache
+  labels:
+    app: ttyd-apache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ttyd-apache
+  template:
+    metadata:
+      labels:
+        app: ttyd-apache
+    spec:
+      serviceAccountName: ttyd-apache-sa
+      containers:
+      - name: apache
+        image: <ecr_repo>/apache:latest
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/apache2/sites-available
+      - name: ttyd
+        image: <ecr_repo>/ttyd:latest
+        ports:
+        - containerPort: 7681
+      volumes:
+      - name: config-volume
+        configMap:
+          name: apache-config
+```
+
+# ConfigMap para configuração do Apache (helm/ttyd-apache-chart/templates/configmap.yaml):
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apache-config
+  labels:
+    app: ttyd-apache
+data:
+  000-default.conf: |
+    <VirtualHost *:80>
+        ServerName ttyd-apache.local
+
+        <Location />
+            AuthType Basic
+            AuthName "Restricted Access"
+            AuthBasicProvider ldap
+            AuthLDAPURL ldap://ldap-server:389/ou=users,dc=example,dc=com?uid
+            Require valid-user
+        </Location>
+
+        ProxyPass / http://localhost:7681/
+        ProxyPassReverse / http://localhost:7681/
+    </VirtualHost>
+```
+
+# Service (helm/ttyd-apache-chart/templates/service.yaml):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ttyd-apache
+spec:
+  selector:
+    app: ttyd-apache
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+```
+
+# Ingress (helm/ttyd-apache-chart/templates/ingress.yaml):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ttyd-apache-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: ttyd-apache.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ttyd-apache
+            port:
+              number: 80
+```
+
+# RBAC para acesso admin (helm/ttyd-apache-chart/templates/rbac.yaml):
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ttyd-apache-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: admin-access-binding
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: ttyd-apache-sa
+  namespace: default
+```
+
+# Policies e Role para acesso AWS:
+
+Crie a policy abaixo no IAM e associe a uma Role que o ServiceAccount utilizará:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "*",
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+Associe esta Role ao ServiceAccount usando o IRSA:
+
+```yaml
+apiVersion: eks.amazonaws.com/v1
+kind: ServiceAccount
+metadata:
+  name: ttyd-apache-sa
+  namespace: default
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account_id>:role/<role_name>
+```
+
+# Pipeline CI/CD (scripts/build.sh):
+
+```bash
+#!/bin/bash
+
+set -e
+
+# Build Apache image
+docker build -t <ecr_repo>/apache:latest ./Dockerfiles/apache
+
+# Build ttyd image
+docker build -t <ecr_repo>/ttyd:latest ./Dockerfiles/ttyd
+
+# Push images to ECR
+docker push <ecr_repo>/apache:latest
+docker push <ecr_repo>/ttyd:latest
+```
+
+# Deployment Script (scripts/deploy.sh):
+
+```bash
+#!/bin/bash
+
+set -e
+
+helm upgrade --install ttyd-apache ./helm/ttyd-apache-chart -n ttyd-namespace --create-namespace
+```
+
+# CI/CD Workflow (.github/workflows/ci-cd.yaml):
+
+```yaml
+name: CI/CD
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Log in to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and push Docker images
+      run: ./scripts/build.sh
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Deploy to Kubernetes
+      run: ./scripts/deploy.sh
+```
